@@ -1,0 +1,18 @@
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Editor / IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Logs / temp output
+*.log
+*.tmp
+
+# Archives produced when packaging the tool
+*.zip
