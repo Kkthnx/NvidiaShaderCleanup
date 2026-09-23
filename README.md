@@ -107,6 +107,7 @@ The launcher passes any arguments straight through, so `NvidiaShaderCleanup.bat 
 | `-AllUsers` | Also clear every other local user profile, not just the current one. |
 | `-IncludeD3DSCache:$false` | Leave the Windows DirectX shader cache alone. On by default. |
 | `-SkipServices` | Do not touch any Windows service. Caches held open by the driver are then likely to be skipped. |
+| `-SkipRebootSchedule` | Do not queue driver held files for deletion on the next reboot. |
 | `-NoPause` | Skip the "Press Enter to exit" prompt. |
 | `-LogPath <file>` | Write a full transcript of the run to that file. |
 | `-WhatIf` | Standard PowerShell preview, same idea as `-DryRun`. |
@@ -121,7 +122,11 @@ The script self-elevates if you run it without administrator rights.
 
 NVIDIA's article tells you to set **Shader Cache Size** to **Off** in the NVIDIA App, reboot, delete the folders by hand, then turn the setting back on. That works because a rebooted machine with caching off is not holding the files open.
 
-This tool takes the other route to the same place. It stops the processes and services that hold the handles, clears the folders, then puts the services back. No reboot and no setting to remember to restore. If a file is still locked the tool says so per folder and exits with code `1`, rather than pretending it succeeded.
+This tool takes the other route to the same place. It stops the processes and services that hold the handles, clears the folders, then puts the services back. No setting to remember to restore.
+
+A small number of `.nvph` index files are held open by the kernel mode display driver itself. Nothing you can stop will release them, which is the real reason NVIDIA's steps involve a reboot. Rather than tell you to close games that are not running, the tool queues those files for deletion on your next reboot using the same `MoveFileEx` mechanism Windows installers use. They are a few files totalling a few megabytes. The bulk of the cache is cleared immediately.
+
+If a file is genuinely stuck and cannot even be queued, the tool says so per folder and exits with code `1` rather than pretending it succeeded.
 
 If you would rather follow NVIDIA's steps exactly, their article is linked above.
 
@@ -158,6 +163,9 @@ Its shaders are being recompiled and re-cached. That happens once per game after
 
 **Do I need to set Shader Cache Size to Off first?**
 No. The tool stops the NVIDIA processes and services instead, which releases the same locks. See the section above.
+
+**It says files were queued for the next reboot.**
+That is normal and it is not an error. Those few files are held by the display driver and can only go at boot. Reboot when convenient, or leave them, since the driver overwrites them anyway.
 
 **It says a folder was only partly cleared.**
 A game or background app still had files open there. Close your games and the NVIDIA App, then run it again.

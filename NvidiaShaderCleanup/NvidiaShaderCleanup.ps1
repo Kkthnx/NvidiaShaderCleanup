@@ -44,6 +44,10 @@
     caches held open by the driver service are likely to be skipped or
     only partly cleared.
 
+.PARAMETER SkipRebootSchedule
+    Do not queue driver held files for deletion on the next reboot.
+    Those files are then left in place and reported as still in use.
+
 .PARAMETER NoPause
     Do not wait for a key press before exiting. Useful for automation
     or for chaining the script after a driver install.
@@ -88,6 +92,7 @@ param (
 	[switch]$AllUsers,
 	[switch]$IncludeD3DSCache = $true,
 	[switch]$SkipServices,
+	[switch]$SkipRebootSchedule,
 	[switch]$NoPause,
 	[string]$LogPath
 )
@@ -123,6 +128,7 @@ if (-not (Test-Administrator)) {
 	if ($AllUsers) { $forwarded += "-AllUsers" }
 	if (-not $IncludeD3DSCache) { $forwarded += "-IncludeD3DSCache:`$false" }
 	if ($SkipServices) { $forwarded += "-SkipServices" }
+	if ($SkipRebootSchedule) { $forwarded += "-SkipRebootSchedule" }
 	if ($NoPause) { $forwarded += "-NoPause" }
 	if ($LogPath) { $forwarded += @("-LogPath", $LogPath) }
 
@@ -157,6 +163,38 @@ if ($LogPath) {
 # -----------------------------
 # Helpers
 # -----------------------------
+# Some cache files are held open by the kernel mode display driver
+# itself, not by any process or service we can stop. Those cannot be
+# deleted while Windows is running with the driver loaded, which is why
+# NVIDIA's own instructions tell you to reboot. MoveFileEx with
+# MOVEFILE_DELAY_UNTIL_REBOOT is the supported way to queue them, the
+# same mechanism Windows installers use.
+$script:CanScheduleDelete = $false
+try {
+	Add-Type -Namespace NvShaderCleanup -Name Native -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+[return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+public static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, int dwFlags);
+"@ -ErrorAction Stop
+	$script:CanScheduleDelete = $true
+}
+catch {
+	Write-Verbose "MoveFileEx is unavailable, locked files cannot be queued for reboot."
+}
+
+function Register-DeleteOnReboot {
+	param ([string]$Path)
+
+	if (-not $script:CanScheduleDelete) { return $false }
+
+	# MOVEFILE_DELAY_UNTIL_REBOOT. A null destination means delete.
+	# It has to be [NullString]::Value, because PowerShell marshals a
+	# plain $null string argument as an empty string, and the call then
+	# fails with ERROR_PATH_NOT_FOUND.
+	try { return [NvShaderCleanup.Native]::MoveFileEx($Path, [NullString]::Value, 4) }
+	catch { return $false }
+}
+
 function Format-Size {
 	param ([long]$Bytes)
 
@@ -322,6 +360,12 @@ function Get-CachePath {
 # These hold open handles on the system profile caches. Stopping a
 # container service also stops whatever depends on it, so those
 # dependents are recorded and started again in reverse order.
+#
+# Order matters. These must go down before the processes are touched,
+# because nvcontainer.exe is the host process for the NvContainer
+# services. Killing it first makes the service control manager restart
+# the service straight away, which re-locks the caches we are about to
+# clear.
 $serviceNames = @(
 	"NVDisplay.ContainerLocalSystem",
 	"NvContainerLocalSystem",
@@ -332,7 +376,18 @@ function Stop-NvidiaService {
 	[CmdletBinding(SupportsShouldProcess)]
 	param ()
 
+	# Restart order is the reverse of this list, so a host service has
+	# to sit after its own dependents.
 	$stopped = New-Object System.Collections.Generic.List[string]
+
+	# Snapshot taken before anything is touched, so the restart pass can
+	# also put back a service that went down some other way, for example
+	# because its host process died.
+	$wasRunning = New-Object System.Collections.Generic.List[string]
+	foreach ($name in $serviceNames) {
+		$running = Get-Service -Name $name -ErrorAction SilentlyContinue
+		if ($running -and $running.Status -eq "Running") { $wasRunning.Add($name) }
+	}
 
 	foreach ($name in $serviceNames) {
 		$service = Get-Service -Name $name -ErrorAction SilentlyContinue
@@ -360,6 +415,12 @@ function Stop-NvidiaService {
 		catch {
 			Write-Host ("  -> Could not stop it. Caches it holds open may be skipped.") -ForegroundColor Yellow
 		}
+	}
+
+	# Anything that was running at the start but never made it onto the
+	# restart list goes on the end, which means it is restarted first.
+	foreach ($name in $wasRunning) {
+		if (-not $stopped.Contains($name)) { $stopped.Add($name) }
 	}
 
 	return $stopped
@@ -402,6 +463,12 @@ function Start-NvidiaService {
 # -----------------------------
 # Not critical and they relaunch on their own. Stopping them releases
 # the handles they keep on the per user caches.
+#
+# nvcontainer.exe is deliberately absent. It is the host process for
+# the NvContainer services, so killing it makes the service control
+# manager restart the service and re-lock the caches. Those go down
+# through Stop-NvidiaService instead, which is why services are
+# stopped before processes.
 $processNames = @(
 	"NVIDIA app",
 	"NVIDIA Share",
@@ -409,7 +476,6 @@ $processNames = @(
 	"NVIDIA Overlay",
 	"NVIDIA Broadcast",
 	"NVIDIA Broadcast UI",
-	"nvcontainer",
 	"nvsphelper64",
 	"NvOAWrapperCache",
 	"NvTelemetryContainer"
@@ -459,11 +525,11 @@ function Clear-ShaderCache {
 	if ($Preview) {
 		Write-Host ("[WOULD CLEAR] {0}" -f $Path)
 		Write-Host ("  -> {0}" -f (Format-Size $before)) -ForegroundColor Yellow
-		return [PSCustomObject]@{ Path = $Path; Freed = $before; Complete = $true }
+		return [PSCustomObject]@{ Path = $Path; Freed = $before; Complete = $true; Queued = 0 }
 	}
 
 	if (-not $PSCmdlet.ShouldProcess($Path, "Delete shader cache contents")) {
-		return [PSCustomObject]@{ Path = $Path; Freed = [long]0; Complete = $true }
+		return [PSCustomObject]@{ Path = $Path; Freed = [long]0; Complete = $true; Queued = 0 }
 	}
 
 	Write-Host ("[CLEAR] {0}" -f $Path)
@@ -475,17 +541,32 @@ function Clear-ShaderCache {
 	$freed = $before - $after
 	if ($freed -lt 0) { $freed = [long]0 }
 
-	$leftovers = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
-	$complete = ($leftovers.Count -eq 0)
+	$leftovers = @(Get-ChildItem -LiteralPath $Path -Force -File -Recurse -ErrorAction SilentlyContinue)
+	$queued = 0
 
-	if ($complete) {
+	# Whatever survived is held by the driver. Queue it for the next
+	# reboot rather than telling the user to try again, which would
+	# never work while the driver is loaded.
+	if ($leftovers.Count -gt 0 -and -not $SkipRebootSchedule) {
+		foreach ($leftover in $leftovers) {
+			if (Register-DeleteOnReboot -Path $leftover.FullName) { $queued++ }
+		}
+	}
+
+	$stuck = $leftovers.Count - $queued
+	$complete = ($stuck -eq 0)
+
+	if ($leftovers.Count -eq 0) {
 		Write-Host ("  -> Cleared, {0} freed" -f (Format-Size $freed)) -ForegroundColor Green
 	}
+	elseif ($complete) {
+		Write-Host ("  -> Cleared, {0} freed, {1} driver held file(s) queued for the next reboot" -f (Format-Size $freed), $queued) -ForegroundColor Green
+	}
 	else {
-		Write-Host ("  -> Partly cleared, {0} freed, {1} item(s) still in use" -f (Format-Size $freed), $leftovers.Count) -ForegroundColor Yellow
+		Write-Host ("  -> Partly cleared, {0} freed, {1} file(s) still in use" -f (Format-Size $freed), $stuck) -ForegroundColor Yellow
 	}
 
-	return [PSCustomObject]@{ Path = $Path; Freed = $freed; Complete = $complete }
+	return [PSCustomObject]@{ Path = $Path; Freed = $freed; Complete = $complete; Queued = $queued }
 }
 
 # -----------------------------
@@ -502,16 +583,18 @@ try {
 		Write-Host "Either the NVIDIA driver is not installed, or the caches are already empty."
 	}
 	else {
-		if (-not $DryRun -and -not $SkipServices) {
+		if (-not $DryRun) {
+			# Services first. See the note above $processNames for why
+			# the other order re-locks everything.
+			if (-not $SkipServices) {
+				$stoppedServices = Stop-NvidiaService
+				Write-Host ""
+			}
+
 			Stop-NvidiaProcess
-			Write-Host ""
-			$stoppedServices = Stop-NvidiaService
 
 			# Windows needs a moment to release the handles.
 			Start-Sleep -Seconds 2
-		}
-		elseif (-not $DryRun -and $SkipServices) {
-			Stop-NvidiaProcess
 		}
 
 		Write-Host ""
@@ -520,10 +603,12 @@ try {
 
 		[long]$totalFreed = 0
 		$incomplete = 0
+		$totalQueued = 0
 
 		foreach ($path in $cachePaths) {
 			$result = Clear-ShaderCache -Path $path -Preview:$DryRun
 			$totalFreed += $result.Freed
+			$totalQueued += $result.Queued
 			if (-not $result.Complete) { $incomplete++ }
 		}
 
@@ -546,6 +631,7 @@ finally {
 # -----------------------------
 if (-not (Test-Path Variable:totalFreed)) { [long]$totalFreed = 0 }
 if (-not (Test-Path Variable:incomplete)) { $incomplete = 0 }
+if (-not (Test-Path Variable:totalQueued)) { $totalQueued = 0 }
 
 Write-Host ""
 Write-Host "=================================================" -ForegroundColor DarkGreen
@@ -559,6 +645,10 @@ elseif ($DryRun) {
 else {
 	Write-Host " Cleanup Complete" -ForegroundColor Green
 	Write-Host (" Space freed: {0}" -f (Format-Size $totalFreed))
+	if ($totalQueued -gt 0) {
+		Write-Host (" {0} file(s) are held by the display driver and were" -f $totalQueued) -ForegroundColor Cyan
+		Write-Host " queued for deletion on your next reboot." -ForegroundColor Cyan
+	}
 	if ($incomplete -gt 0) {
 		Write-Host (" {0} folder(s) were only partly cleared" -f $incomplete) -ForegroundColor Yellow
 		Write-Host " Close your games and the NVIDIA App, then run it again." -ForegroundColor Yellow
