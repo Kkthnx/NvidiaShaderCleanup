@@ -1,0 +1,11 @@
+# Normalize text in the repo, check it out the way Windows expects.
+* text=auto
+
+# Batch files must be CRLF. A .bat with LF endings can break label and
+# goto parsing on some Windows setups.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.png binary
+*.zip binary
