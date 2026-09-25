@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" alt="NVIDIA Shader Cache Cleanup logo" width="220" />
+<img width="1280" height="640" alt="banner-1280x640" src="https://github.com/user-attachments/assets/9add9003-7c5e-411a-9252-2b62a9f21365" />
 
 # NVIDIA Shader Cache Cleanup
 
